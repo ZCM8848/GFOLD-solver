@@ -1,55 +1,60 @@
 # TOF-Net
 
-为 [G-FOLD](https://github.com/samutoljamo/g-fold) 求解器外挂一个**学习型飞行时间（TOF）预测器**：离线蒙特卡洛采样生成「状态/约束 → 最优 TOF」数据集，训练一个双头 MLP（可行性分类 + TOF 回归），在线时跳过求解器内部的 TOF 搜索，实现高频 MPC 动力下降制导。
+A learned **Time-of-Flight (TOF) predictor** bolted onto the [G-FOLD](https://github.com/samutoljamo/g-fold) solver. Offline Monte-Carlo sampling produces a "state/constraints → optimal TOF" dataset; a dual-head MLP (feasibility classification + TOF regression) is trained on it. At runtime the predictor skips the solver's internal TOF search, enabling high-frequency MPC powered-descent guidance.
 
-本仓库实现三模块：**数据生成**、**训练**、**推理**。
+This repository implements all three modules: **data generation**, **training**, and **inference**.
 
-## 目录结构
+## Directory layout
 
 ```
 GFOLD-solver/
-├── common/                 # 共享契约（三段共用）
-│   ├── config.py           # 特征 schema + 采样范围 + min-max 归一化边界 + 常量（无 torch 依赖）
-│   └── model.py            # 双头 MLP 架构（训练/推理共用，依赖 torch）
-├── generation/             # 模块一：数据生成
-│   ├── sampling.py         # 因果一致采样（纯函数）
-│   └── generate.py         # 多进程生成 + rich TUI + shard 续传 + JSONL 落盘
-├── training/               # 模块二：训练
-│   ├── dataset.py          # 读 shard + 归一化 + 分层切分（支持 GPU 显存预加载）
-│   └── train.py            # BCE+λ·MSE 训练 + PR 阈值选择 + checkpoint
-├── inference/              # 模块三：推理
-│   └── predictor.py        # 加载 checkpoint → (p_feasible, tf)
+├── common/                 # Shared contract (used by all three modules)
+│   ├── config.py           # Feature schema + sampling ranges + min-max bounds + constants (no torch)
+│   └── model.py            # Dual-head MLP architecture (shared by training/inference, needs torch)
+├── generation/             # Module 1: data generation
+│   ├── sampling.py         # Causally-consistent sampling (pure functions)
+│   ├── gfold_glue.py       # Feature vector -> gfold.Config + solve helpers
+│   └── generate.py         # Multiprocess generation + rich TUI + shard resume + JSONL logging
+├── training/               # Module 2: training
+│   ├── dataset.py          # Reads shards + normalization + stratified split (GPU preload support)
+│   ├── train.py            # BCE + λ·MSE training, PR threshold selection, checkpointing
+│   └── evaluate.py         # Predicted-TF -> fixed-TF re-solve: success rate + fuel suboptimality
+├── inference/              # Module 3: inference
+│   └── predictor.py        # Loads a checkpoint -> (p_feasible, tf)
+├── visualization/          # Interactive (plotly) HTML reports
+│   ├── trajectory.py       # 3D trajectory + time-series panels
+│   ├── dataset_eda.py      # Feasibility / mean-TF heatmaps + histograms
+│   ├── training.py         # Training curves from train_metrics.csv
+│   └── evaluate.py         # Prediction scatter, suboptimality, confusion matrix, PR curve
 ├── scripts/
-│   ├── run_generate.py     # PyInstaller 打包入口
-│   └── build_exe.ps1       # 打包脚本
-├── docs/                   # 设计文档
-│   ├── TOF-Net设计方案.md
-│   └── gfold_Python_API文档.md
+│   ├── run_generate.py     # PyInstaller entry point
+│   └── build_exe.ps1       # Build script for the data-generator exe
+├── docs/                   # Design documents
 ├── requirements.txt
 └── .gitignore
 ```
 
-## 安装
+## Installation
 
-环境：miniforge 环境 `KRPC`（Python 3.12）。
+Environment: miniforge env `KRPC` (Python 3.12).
 
 ```bash
-# 核心依赖
-python -m pip install gfold numpy rich psutil
-# torch 用 CPU 索引单独装（训练/推理用，数据生成 exe 不需要）
+# Core dependencies
+python -m pip install gfold numpy rich psutil plotly
+# torch via the CPU index (training/inference only; the data-generator exe does not need it)
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-## 约定（三段共享的契约，勿改动）
+## Conventions (the shared contract — do not change casually)
 
-### 坐标系
+### Coordinate frame
 
-- **z-up**；重力沿 −z，大小固定为 Kerbin 表面重力 `g = 9.81 m/s²`（`GRAVITY = [0,0,-9.81]`）
-- 目标着陆点为**原点**，目标速度 `[0,0,0]`
-- 位置、速度均为相对目标点的量
-- 离散节点数固定 `n = 100`；`max_velocity = 600`（保证初始速度不违反 SOC 约束）
+- **z-up**; gravity along −z, fixed at Kerbin surface gravity `g = 9.81 m/s²` (`GRAVITY = [0,0,-9.81]`)
+- Target landing point is the **origin**, target velocity `[0,0,0]`
+- Positions and velocities are relative to the target
+- Fixed discretization `n = 100`; `max_velocity = 600` (ensures the initial state never violates the SOC velocity constraint)
 
-### 特征 schema（14 维，顺序即契约）
+### Feature schema (14-D, order is the contract)
 
 ```
 [x, y, z, vx, vy, vz, dry_mass, fuel, real_max_thrust,
@@ -57,175 +62,174 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
  glide_slope_angle_deg, max_angle_deg]
 ```
 
-### 归一化
+### Normalization
 
-min-max 到 `[0,1]`，边界在 `common/config.py` 的 `NORM_BOUNDS`（**先验已知**，非统计量），
-生成时写入 `meta.json`，训练/推理读同一份，保证三段一致。
+Min-max to `[0,1]` using `NORM_BOUNDS` in `common/config.py` (priors, not dataset statistics). They are written into `meta.json` at generation time and read identically by training and inference so the three stages never drift.
 
-### 因果采样链（保证物理自洽）
+### Causal sampling chain (physically self-consistent)
 
 ```
-质量链：dry_mass -> dry_frac(=dry/wet_full) -> wet_full
-        -> remaining_frac -> fuel, wet_mass
-推力链：twr_max -> real_max_thrust = twr_max * wet_mass * g
-        （min_thrust_pct < max_thrust_pct 恒成立；有效 TWR = twr_max * max_pct > 1）
-Isp   -> fuel_consumption = 1 / (Isp * 9.80665)
+Mass chain:      dry_mass -> dry_frac (= dry/wet_full) -> wet_full
+                 -> remaining_frac -> fuel, wet_mass
+Thrust chain:    twr_max -> real_max_thrust = twr_max * wet_mass * g
+                 (min_thrust_pct < max_thrust_pct always; effective TWR = twr_max * max_pct > 1)
+Isp chain:       isp -> fuel_consumption = 1 / (isp * 9.80665)
 ```
 
-完整范围见 `common/config.py` 的 `RANGES`。
+Full ranges live in `RANGES` in `common/config.py`.
 
-### gfold API 两个关键事实（详见 docs/gfold_Python_API文档.md）
+### Two gfold API facts (see docs/gfold_Python_API文档.md)
 
-1. **嵌套字段赋值静默失效**：必须用构造式注入或整体替换嵌套对象，不能
-   `cfg.solver.time_of_flight = ...`。
-2. **最优 TF 不直接暴露**：从结果恢复 `tf = time_points[-1] * n/(n-1)`。
+1. **Nested-field assignment silently does nothing** — you must construct-inject or replace whole nested objects; `cfg.solver.time_of_flight = ...` is a no-op.
+2. **The optimal TOF is not exposed directly** — recover it as `tf = time_points[-1] * n / (n - 1)`.
 
-## 数据集格式
+## Dataset format
 
-生成产物全部在 `data/`（shard + 元数据）与 `logs/`（逐样本 JSONL）。
+Generation writes to `data/` (shards + metadata) and `logs/` (per-sample JSONL).
 
-### shard：`data/shard_<start>.npz`
+### `data/shard_<start>.npz`
 
-每个 shard 默认 10000 条（`--shard-size` 可调），字段：
+Each shard holds 10,000 samples by default (`--shard-size`), with fields:
 
-| 数组 | 形状 | dtype | 说明 |
+| Array | Shape | dtype | Description |
 |---|---|---|---|
-| `X` | (m, 14) | float64 | 原始特征（未归一化），列顺序见 schema |
-| `y_feasible` | (m,) | int8 | 可行性标签 0/1 |
-| `y_tf` | (m,) | float64 | 最优 TOF（秒）；不可行样本为 NaN |
-| `objective` | (m,) | float64 | 优化目标 = ln(末端质量)；不可行为 NaN |
-| `final_mass` | (m,) | float64 | 末端质量 kg；不可行为 NaN |
-| `fuel_used` | (m,) | float64 | 燃料消耗 kg；不可行为 NaN |
-| `solve_ms` | (m,) | float64 | 求解耗时 ms |
-| `index` | (m,) | int64 | 全局样本索引（同 seed 可复现；shard 内乱序，以 index 为准） |
+| `X` | (m, 14) | float64 | Raw features (unnormalized), columns per schema |
+| `y_feasible` | (m,) | int8 | Feasibility label 0/1 |
+| `y_tf` | (m,) | float64 | Optimal TOF (s); NaN for infeasible samples |
+| `objective` | (m,) | float64 | Objective = ln(final mass); NaN if infeasible |
+| `final_mass` | (m,) | float64 | Final mass (kg); NaN if infeasible |
+| `fuel_used` | (m,) | float64 | Fuel consumed (kg); NaN if infeasible |
+| `solve_ms` | (m,) | float64 | Solver time (ms) |
+| `index` | (m,) | int64 | Global sample index (deterministic under a fixed seed; in-shard order is arbitrary, key on `index`) |
 
-### `data/meta.json` —— 契约快照
+### `data/meta.json` — contract snapshot
 
-记录 `schema_version`、`features`（顺序）、`norm_bounds`、`ranges`、`g`、`n` 等。
-训练与推理必须读取此文件而非硬编码。
+Records `schema_version`, `features` (order), `norm_bounds`, `ranges`, `g`, `n`, etc. Training and inference must read this file rather than hard-coding.
 
-### `data/manifest.json` —— 续传状态
+### `data/manifest.json` — resume state
 
 ```json
 {"n_done": 100000, "shards": ["shard_00000000.npz", ...]}
 ```
 
-### `logs/samples.jsonl` —— 逐样本全量日志（provenance）
+### `logs/samples.jsonl` — per-sample provenance log
 
-每行一个 JSON：`index`、`features`、`feasible`、`tf`、`objective`、`final_mass`、
-`fuel_used`、`status`、`solve_ms`。不可行样本的 `status` 为 gfold 异常消息
-（多为 `infeasible: no feasible time-of-flight in [...]`）。
+One JSON object per line: `index`, `features`, `feasible`, `tf`, `objective`, `final_mass`, `fuel_used`, `status`, `solve_ms`. For infeasible samples `status` is the gfold exception message (usually `infeasible: no feasible time-of-flight in [...]`).
 
-## 用法（模块一）
+## Generation (module 1)
 
-在项目根目录运行：
+Run from the project root:
 
 ```bash
-# 生成 10 万样本（默认 32 核 = CPU 逻辑核数、seed=0、shard=1 万）
+# Generate 100k samples (default: all logical cores, seed=0, shard=10k)
 python -m generation.generate --n-samples 100000
 
-# 先导批次：跑 2000 条测可行率（写入 data_pilot/，不污染正式数据）
+# Pilot batch: run 2000 samples to check feasibility rate (writes to data_pilot/)
 python -m generation.generate --pilot 2000
 
-# 追加数据：在已有 10 万基础上再补 10 万（同 seed/outdir 自动续传）
+# Append: grow the same dataset from 100k to 200k (same seed/outdir auto-resumes)
 python -m generation.generate --n-samples 200000
 
-# 指定核数 / 种子 / shard 大小 / 输出目录
+# Explicit cores / seed / shard size
 python -m generation.generate --n-samples 100000 --workers 64 --seed 1 --shard-size 20000
 ```
 
-### 全部参数
+### CLI arguments
 
-| 参数 | 默认 | 说明 |
+| Arg | Default | Description |
 |---|---|---|
-| `--n-samples` | 100000 | 数据集**总量目标**；存在 manifest 时自动续传补差额 |
-| `--pilot N` | 0 | 先导批次：只跑 N 条测可行率，写入 `*_pilot` 目录 |
-| `--workers` | `os.cpu_count()` | 并行进程数（gfold 求解不释放 GIL，需多进程） |
-| `--seed` | 0 | 样本 i 用 `seed+i` 生成，同 seed 可整体复现 |
-| `--shard-size` | 10000 | 每个 .npz 的样本数 |
-| `--outdir` | data | shard + manifest + meta 输出目录 |
-| `--logdir` | logs | JSONL 日志目录 |
-| `--logfile` | samples.jsonl | 日志文件名 |
-| `--no-write` | false | 不写 shard（校准用） |
-| `--no-tui` | false | 禁用 TUI |
+| `--n-samples` | 100000 | **Total** dataset target; auto-resumes the remainder if a manifest exists |
+| `--pilot N` | 0 | Pilot batch: run N samples to measure feasibility, writes to `*_pilot` dir |
+| `--workers` | `os.cpu_count()` | Parallel process count (gfold does not release the GIL, so multiprocessing is required) |
+| `--seed` | 0 | Sample i uses `seed+i`; a fixed seed reproduces the whole dataset |
+| `--shard-size` | 10000 | Samples per `.npz` |
+| `--outdir` | data | Output dir for shards + manifest + meta |
+| `--logdir` | logs | JSONL log dir |
+| `--logfile` | samples.jsonl | Log filename |
+| `--no-write` | false | Don't write shards (calibration) |
+| `--no-tui` | false | Disable the TUI |
 
-### 追加 / 续传语义（回答「先 10 万、再补 10 万」）
+### Append / resume semantics
 
-- `--n-samples` 始终表示**数据集总量**。首次 `--n-samples 100000` 生成 0~99999；
-  再运行 `--n-samples 200000`（同 `--outdir`/`--logdir`/`--seed`）会检测 manifest
-  里已完成 100000 条，自动从第 100000 条继续，只补差额，追加到同一批 shard 与日志。
-- 用**相同 `--seed`** 时，续传不影响整体可复现性（每个索引的采样种子确定）。
-- 崩溃安全：shard 先写 `.tmp.npz` 再原子改名，manifest 仅在 shard 落盘后更新；
-  中断后重跑即从最后完成的 shard 边界续传。
+- `--n-samples` always means the **dataset total**. A first `--n-samples 100000` produces indices 0–99999; re-running `--n-samples 200000` (same `--outdir`/`--logdir`/`--seed`) detects 100000 already done in the manifest and continues from index 100000, appending to the same shards and log.
+- With the same `--seed`, resuming does not affect reproducibility (each index has a deterministic sampling seed).
+- Crash-safe: shards are written to `.tmp.npz` and atomically renamed, and the manifest is updated only after a shard is fully written; re-running after an interrupt resumes from the last completed shard boundary.
 
 ### TUI
 
-交互式终端下自动开启 rich 全屏 TUI：顶部进度（总量/可行率/速率/shard/耗时 ETA）、
-中间逐核 CPU 块状图 + 并行 worker 数、底部滚动 worker 成功/失败日志。
-非 TTY（服务器 SSH）自动降级为每 5 秒一行进度；`--no-tui` 强制关闭。
-`Ctrl+C` 优雅退出：冲刷当前 shard + 写 manifest，支持续传。
+On an interactive terminal a rich full-screen TUI starts automatically: top progress (total/feasibility/rate/shards/elapsed ETA), a per-core CPU block map with the active-worker count, and a scrolling worker success/failure log. Non-TTY output (e.g. server SSH) degrades to one progress line every 5 seconds; `--no-tui` forces it off. `Ctrl+C` exits gracefully (flushes the current shard + writes the manifest).
 
-## 打包 exe（丢给服务器）
+## Packaging the exe (for a server)
 
-数据生成器不依赖 torch，exe 只含 gfold/numpy/rich/psutil，体积小、启动快。
+The generator does not depend on torch, so the exe only bundles gfold/numpy/rich/psutil.
 
 ```powershell
-# PowerShell（KRPC 环境）
+# PowerShell (KRPC env)
 powershell -File scripts\build_exe.ps1
-# 或手动：
+# or manually:
 pyinstaller --name tofnet_generate --onedir --clean --noconfirm `
     --paths . --collect-all gfold --hidden-import generation.generate `
     scripts\run_generate.py
 ```
 
-产物在 `dist/tofnet_generate/`，**整个文件夹**拷贝到服务器后：
+The output is `dist/tofnet_generate/`. Copy the **whole folder** to the server, then:
 
 ```bash
-./tofnet_generate.exe --n-samples 100000 --workers <服务器核数>
+./tofnet_generate.exe --n-samples 100000 --workers <server cores>
 ```
 
-- 用 `--onedir`（非 onefile）：多进程 spawn 时子进程直接加载已解压的二进制，避免 onefile 每进程重复解压的开销。
-- 服务器上无需 Python/gfold/torch 环境，参数全部通过命令行传入，保持可调。
+- Use `--onedir` (not onefile): with multiprocessing spawn, child processes load the already-extracted binaries directly, avoiding onefile's per-process re-extraction cost.
+- No Python/gfold/torch environment is needed on the server; everything is adjustable via command-line args.
 
-## 训练（模块二）
+## Training (module 2)
 
 ```bash
-# 全量训练（有 GPU 自动用 GPU 并预加载数据进显存）
+# Full training (auto-uses GPU and preloads data into VRAM when available)
 python -m training.train
 
-# 常用参数
+# Common options
 python -m training.train --epochs 50 --batch 4096 --lr 3e-4 --device auto
 ```
 
-- 损失 `BCE(可行性) + λ·MSE(TF, 仅可行样本)`；TF 用 z-score、输入用 min-max（同 `meta.json`）
-- 按 feasible 分层切 80/10/10；验证集 PR 曲线选阈值（`--beta` 控 Fβ，β<1 偏 precision）
-- 产物 `models/tofnet.pt`（权重 + 契约自包含）+ `models/tofnet.json`（人类可读）
+- Loss `BCE(feasibility) + λ·MSE(TF, feasible samples only)`; TF is z-scored, inputs are min-max normalized (same `meta.json`).
+- Stratified 80/10/10 split by feasibility; the validation PR curve selects the threshold (`--beta` sets Fβ, β<1 favors precision).
+- Outputs `models/tofnet.pt` (weights + self-contained contract) and `models/tofnet.json` (human-readable).
 
-## 推理（模块三）
+## Inference (module 3)
 
 ```python
 from inference.predictor import TOFNetPredictor
-pred = TOFNetPredictor("models/tofnet.pt")     # 常驻内存，只加载一次
-p, tf = pred.predict(features)                  # features: 14 维原始物理量（FEATURES 顺序）
-feasible, p, tf = pred.decide(features)         # 按训练阈值决策
+pred = TOFNetPredictor("models/tofnet.pt")     # resident in memory, loaded once
+p, tf = pred.predict(features)                  # features: 14-D raw physics (FEATURES order)
+feasible, p, tf = pred.decide(features)         # decision at the trained threshold
 ```
 
 ```bash
 python -m inference.predictor --ckpt models/tofnet.pt   # demo
 ```
 
-- 单样本返回 `(float, float)`；批量 `(B,14)` 返回张量；`predict_from_dict(dict)` 按特征名取
-- 在线用 `decide`：`p >= threshold` 判可行；低于阈值应 fallback 到完整 TOF 搜索
+- Single sample returns `(float, float)`; a `(B,14)` batch returns tensors; `predict_from_dict(dict)` picks values by feature name.
+- Online, use `decide`: `p >= threshold` means feasible; below the threshold, fall back to a full TOF search.
 
-## 评估（下游价值验证）
+## Evaluation (downstream value)
 
 ```bash
 python -m training.evaluate --n-feasible 1000 --n-infeasible 1000
 ```
 
-对 held-out 可行样本用预测 TF 固定重解，报告求解成功率 + 燃料 suboptimality，
-并与「常数 TF」基线、oracle（最优 TF 标签）对照；同时报告阈值处的分类代价。
+For held-out feasible samples, re-solves gfold at the predicted TOF and reports solve success rate + fuel suboptimality, compared against a "constant TOF" baseline and an oracle (optimal-TF label); also reports the classification cost at the threshold.
 
-## 待实现
+## Visualization (interactive)
 
-- 在线 MPC 闭环（kRPC + KSP）——属 KSP-Auto-Landing 项目职责，本仓库只提供估计器
+All output is self-contained HTML (plotly.js embedded) written to `figures/`.
+
+```bash
+python -m visualization.trajectory --random --seed 1      # 3D trajectory + time series
+python -m visualization.dataset_eda --surface             # feasibility/mean-TF heatmaps (+3D surfaces)
+python -m visualization.training                          # training curves
+python -m visualization.evaluate --n-feasible 500         # evaluation plots
+```
+
+## Roadmap
+
+- Online MPC closed loop (kRPC + KSP) — this lives in the KSP-Auto-Landing project; this repository only provides the estimator.

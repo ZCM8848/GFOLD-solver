@@ -3,6 +3,7 @@ __pycache__/
 data/
 logs/
 models/
+figures/
 .venv/
 build/
 dist/

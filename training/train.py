@@ -10,6 +10,7 @@
 """
 
 import argparse
+import csv
 import json
 import os
 import time
@@ -115,6 +116,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="TOF-Net 训练")
     p.add_argument("--datadir", default="data")
     p.add_argument("--outdir", default="models")
+    p.add_argument("--logdir", default="logs")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -197,6 +199,13 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     ckpt_path = os.path.join(args.outdir, "tofnet.pt")
 
+    os.makedirs(args.logdir, exist_ok=True)
+    csv_file = open(os.path.join(args.logdir, "train_metrics.csv"), "w",
+                    newline="", encoding="utf-8")
+    csv_w = csv.writer(csv_file)
+    csv_w.writerow(["epoch", "lr", "train_loss", "train_bce", "train_mse",
+                    "val_loss", "val_ap", "val_acc", "val_mae", "val_rmse"])
+
     best_loss = float("inf")
     best_state = None
     best_val_probs = None
@@ -221,6 +230,10 @@ def main():
         sched.step()
 
         vm = evaluate(model, loaders["val"], stats, device, lam=args.lam)
+        csv_w.writerow([epoch, opt.param_groups[0]["lr"],
+                        run_loss / n, run_bce / n, run_mse / n,
+                        vm["loss"], vm["ap"], vm["acc"], vm["mae"], vm["rmse"]])
+        csv_file.flush()
         line = (f"epoch {epoch:3d}/{args.epochs}  "
                 f"train {run_loss/n:.4f} (bce {run_bce/n:.4f} mse {run_mse/n:.4f})  "
                 f"val loss {vm['loss']:.4f}  AP {vm['ap']:.4f}  acc {vm['acc']:.4f}  "
@@ -235,6 +248,8 @@ def main():
             best_val_feas = vm["feas"]
             best_metrics = {k: vm[k] for k in ["ap", "acc", "mae", "rmse", "bce", "mse", "loss"]}
             print(f"  -> 新最佳 val loss {best_loss:.4f}", flush=True)
+
+    csv_file.close()
 
     # 用最佳模型在验证集上选阈值
     threshold, fbeta = select_threshold(best_val_probs, best_val_feas, beta=args.beta)
