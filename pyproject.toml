@@ -16,7 +16,9 @@ dependencies = [
 gen = ["rich", "psutil"]
 train = ["torch", "scikit-learn"]
 viz = ["plotly"]
-all = ["rich", "psutil", "torch", "scikit-learn", "plotly"]
+onnx = ["onnx", "onnxruntime", "onnxscript"]
+dev = ["pytest"]
+all = ["rich", "psutil", "torch", "scikit-learn", "plotly", "onnx", "onnxruntime", "onnxscript", "pytest"]
 
 [tool.setuptools]
 packages = ["common", "generation", "training", "inference", "visualization"]

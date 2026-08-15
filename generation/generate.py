@@ -77,10 +77,14 @@ def build_config(d: dict):
 
 
 def recover_tf(traj) -> float:
-    """API 不暴露 time_of_flight，从 time_points 恢复：tf = tp[-1] * n/(n-1)。"""
+    """API 不暴露 time_of_flight，从 time_points 恢复：tf = n * dt（dt = tp[1]-tp[0]）。
+
+    用「节点数 × 首段 dt」而非依赖最后一点，对上游 time_points 语义更稳健。
+    """
     tp = np.asarray(traj.time_points)
-    n = len(tp)
-    return float(tp[-1] * n / (n - 1)) if n > 1 else 0.0
+    if len(tp) < 2:
+        return 0.0
+    return float(len(tp) * (tp[1] - tp[0]))
 
 
 def worker(task):
@@ -305,6 +309,11 @@ class Generator:
             self.n_shards = 0
 
     def _write_meta(self):
+        try:
+            from importlib.metadata import version
+            gfold_version = version("gfold")
+        except Exception:  # noqa: BLE001
+            gfold_version = "unknown"
         meta = {
             "schema_version": cfg.SCHEMA_VERSION,
             "features": cfg.FEATURES,
@@ -316,6 +325,7 @@ class Generator:
             "gravity": cfg.GRAVITY,
             "target_position": cfg.TARGET_POSITION,
             "target_velocity": cfg.TARGET_VELOCITY,
+            "gfold_version": gfold_version,
         }
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)

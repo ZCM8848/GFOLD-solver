@@ -35,16 +35,19 @@ def combined_loss(logits, tf_pred, y_feas, y_tf, lam=1.0):
 def evaluate(model, loader, stats, device, lam=1.0):
     model.eval()
     probs, feas_true, tf_true, tf_pred = [], [], [], []
-    tot_bce, tot_mse, n = 0.0, 0.0, 0
+    tot_bce, tot_mse, n_all, n_feas = 0.0, 0.0, 0, 0
     with torch.no_grad():
         for x, yf, yt in loader:
             x, yf, yt = x.to(device), yf.to(device), yt.to(device)
             logits, tfp = model(x)
             bce = F.binary_cross_entropy_with_logits(logits.view(-1), yf)
             mse = ((tfp.view(-1) - yt) ** 2 * yf).sum() / (yf.sum() + 1e-8)
-            tot_bce += float(bce)
-            tot_mse += float(mse)
-            n += 1
+            bs = x.shape[0]
+            fb = float(yf.sum())
+            tot_bce += float(bce) * bs
+            tot_mse += float(mse) * fb
+            n_all += bs
+            n_feas += fb
             probs.append(torch.sigmoid(logits).cpu().numpy().ravel())
             feas_true.append(yf.cpu().numpy().ravel())
             tf_true.append(yt.cpu().numpy().ravel())
@@ -64,9 +67,11 @@ def evaluate(model, loader, stats, device, lam=1.0):
     mae = float(np.mean(np.abs(tt - tp)))
     rmse = float(np.sqrt(np.mean((tt - tp) ** 2)))
 
+    bce_avg = tot_bce / n_all
+    mse_avg = tot_mse / max(n_feas, 1)
     return {
-        "loss": (tot_bce + lam * tot_mse) / n,
-        "bce": tot_bce / n, "mse": tot_mse / n,
+        "loss": bce_avg + lam * mse_avg,
+        "bce": bce_avg, "mse": mse_avg,
         "ap": ap, "acc": acc, "mae": mae, "rmse": rmse,
         "probs": probs, "feas": feas_true,
     }
@@ -122,6 +127,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--wd", type=float, default=1e-4)
     p.add_argument("--lam", type=float, default=1.0, help="回归损失权重 λ")
+    p.add_argument("--clip", type=float, default=1.0, help="梯度裁剪 max_norm，0=禁用")
     p.add_argument("--hidden", type=int, nargs="+", default=[128, 128, 64])
     p.add_argument("--act", default="silu", choices=["silu", "relu", "gelu"])
     p.add_argument("--dropout", type=float, default=0.0)
@@ -215,27 +221,35 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
-        run_loss, run_bce, run_mse, n = 0.0, 0.0, 0.0, 0
+        run_bce, run_mse, n_all, n_feas = 0.0, 0.0, 0, 0
         for x, yf, yt in loaders["train"]:
             x, yf, yt = x.to(device), yf.to(device), yt.to(device)
             logits, tfp = model(x)
             loss, bce, mse = combined_loss(logits, tfp, yf, yt, lam=args.lam)
             opt.zero_grad()
             loss.backward()
+            if args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             opt.step()
-            run_loss += loss.item()
-            run_bce += bce
-            run_mse += mse
-            n += 1
+            bs = x.shape[0]
+            fb = float(yf.sum())
+            run_bce += bce * bs
+            run_mse += mse * fb
+            n_all += bs
+            n_feas += fb
         sched.step()
+
+        bce_avg = run_bce / n_all
+        mse_avg = run_mse / max(n_feas, 1)
+        loss_avg = bce_avg + args.lam * mse_avg
 
         vm = evaluate(model, loaders["val"], stats, device, lam=args.lam)
         csv_w.writerow([epoch, opt.param_groups[0]["lr"],
-                        run_loss / n, run_bce / n, run_mse / n,
+                        loss_avg, bce_avg, mse_avg,
                         vm["loss"], vm["ap"], vm["acc"], vm["mae"], vm["rmse"]])
         csv_file.flush()
         line = (f"epoch {epoch:3d}/{args.epochs}  "
-                f"train {run_loss/n:.4f} (bce {run_bce/n:.4f} mse {run_mse/n:.4f})  "
+                f"train {loss_avg:.4f} (bce {bce_avg:.4f} mse {mse_avg:.4f})  "
                 f"val loss {vm['loss']:.4f}  AP {vm['ap']:.4f}  acc {vm['acc']:.4f}  "
                 f"MAE {vm['mae']:.3f}s  RMSE {vm['rmse']:.3f}s  "
                 f"[{time.time()-t0:.1f}s]")

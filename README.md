@@ -31,7 +31,6 @@ GFOLD-solver/
 │   └── build_exe.ps1       # Build script for the data-generator exe
 ├── docs/                   # Design documents
 ├── pyproject.toml          # Package metadata (installable via pip install -e .)
-├── requirements.txt
 └── .gitignore
 ```
 
@@ -221,6 +220,49 @@ python -m inference.predictor --ckpt models/tofnet.pt   # demo
 
 - Single sample returns `(float, float)`; a `(B,14)` batch returns tensors; `predict_from_dict(dict)` picks values by feature name.
 - Online, use `decide`: `p >= threshold` means feasible; below the threshold, fall back to a full TOF search.
+
+### Runtime note: run the predictor on CPU
+
+At runtime the GPU is typically occupied by the game/renderer, and for a 27k-parameter MLP the CPU forward is actually **faster** than the GPU (kernel launch overhead dominates). Measured single-sample prediction: **~0.4 ms median on CPU vs ~1.5 ms on GPU**.
+
+```python
+import torch
+torch.set_num_threads(1)                                   # single-sample inference: cut thread-pool jitter
+pred = TOFNetPredictor("models/tofnet.pt", device="cpu")   # resident, loaded once
+```
+
+### ONNX export (optional)
+
+```bash
+python -m inference.onnx --ckpt models/tofnet.pt   # exports + validates + latency compare
+```
+
+Exports a self-contained `models/tofnet.onnx` — input is the 14-D raw feature vector, outputs are `p_feasible` and `tf` (seconds), with normalization / sigmoid / de-standardization baked into the graph. Run it with onnxruntime (no torch needed):
+
+```python
+from inference.onnx import OnnxPredictor
+pred = OnnxPredictor("models/tofnet.onnx")
+p, tf = pred.predict(features)
+```
+
+Measured single-sample forward: ~1.1 µs (onnxruntime) vs ~4.9 µs (torch CPU) — ~4.3× faster and lower-jitter. This only trims the prediction step; the end-to-end time is still dominated by the gfold solve (~14 ms), so the total speedup stays ~32×.
+
+## Benchmark (G-FOLD search vs TOF-Net + fixed-TF solve)
+
+```bash
+python -m training.benchmark --n 300 --device cpu
+```
+
+On the same held-out feasible samples (n=300, predictor on CPU):
+
+| Path | median | p90 |
+|---|---|---|
+| A. G-FOLD internal TOF search | 444 ms | 523 ms |
+| B. TOF-Net fixed-TF solve | 14.0 ms | 17.8 ms |
+| └ prediction forward | 0.4 ms | 0.5 ms |
+| └ end-to-end (predict + solve) | 14.5 ms | 18.5 ms |
+
+**Speedup: ~32×** (median), fixed-solve success rate **96.7%**. The end-to-end median of ~14.5 ms fits the 60 Hz budget (~16.7 ms); the ~3% of samples whose predicted TF fails fall back to a full search.
 
 ## Evaluation (downstream value)
 
