@@ -1,0 +1,6 @@
+# 安装（torch 建议用 CPU 索引单独装，避免拉取 CUDA 大包）：
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+gfold
+numpy
+rich
+psutil
