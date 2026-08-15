@@ -30,6 +30,7 @@ GFOLD-solver/
 │   ├── run_generate.py     # PyInstaller entry point
 │   └── build_exe.ps1       # Build script for the data-generator exe
 ├── docs/                   # Design documents
+├── pyproject.toml          # Package metadata (installable via pip install -e .)
 ├── requirements.txt
 └── .gitignore
 ```
@@ -38,12 +39,22 @@ GFOLD-solver/
 
 Environment: miniforge env `KRPC` (Python 3.12).
 
+Install the package in editable mode so `common`, `generation`, `training`, `inference` and `visualization` are importable from any directory:
+
 ```bash
-# Core dependencies
+python -m pip install -e .            # base: numpy + gfold
+python -m pip install -e ".[all]"     # + rich, psutil, torch, scikit-learn, plotly
+```
+
+Or install the dependencies manually:
+
+```bash
 python -m pip install gfold numpy rich psutil plotly
 # torch via the CPU index (training/inference only; the data-generator exe does not need it)
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
+
+> After `pip install -e .` you can run scripts as modules (`python -m inference.predictor`) or as plain files (`python inference/predictor.py`) from anywhere — the package paths resolve regardless of the working directory.
 
 ## Conventions (the shared contract — do not change casually)
 

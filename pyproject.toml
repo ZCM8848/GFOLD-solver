@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tofnet"
+version = "0.1.0"
+description = "TOF-Net: learned time-of-flight predictor for the G-FOLD solver"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "gfold",
+]
+
+[project.optional-dependencies]
+gen = ["rich", "psutil"]
+train = ["torch", "scikit-learn"]
+viz = ["plotly"]
+all = ["rich", "psutil", "torch", "scikit-learn", "plotly"]
+
+[tool.setuptools]
+packages = ["common", "generation", "training", "inference", "visualization"]
