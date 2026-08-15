@@ -9,42 +9,50 @@ import numpy as np
 from common import config as cfg
 
 
-def sample_one(rng: np.random.Generator) -> dict:
-    """采样一个因果自洽的参数集。返回物理量 dict（含派生量 wet_mass）。"""
+def sample_one(rng: np.random.Generator, overrides: dict = None) -> dict:
+    """采样一个因果自洽的参数集。返回物理量 dict（含派生量 wet_mass）。
+
+    overrides: 覆盖独立输入参数（如 {"z": 9000.0}）用于边界外推采样，
+    派生量仍按因果链重算，保证物理自洽。
+    """
     R = cfg.RANGES
+    ov = overrides or {}
+
+    def u(name):
+        return float(ov[name]) if name in ov else float(rng.uniform(*R[name]))
 
     # 质量链
-    dry_mass = float(rng.uniform(*R["dry_mass"]))
-    dry_frac = float(rng.uniform(*R["dry_frac"]))
+    dry_mass = u("dry_mass")
+    dry_frac = u("dry_frac")
     wet_full = dry_mass / dry_frac
-    remaining_frac = float(rng.uniform(*R["remaining_frac"]))
+    remaining_frac = u("remaining_frac")
     fuel = (wet_full - dry_mass) * remaining_frac
     wet_mass = dry_mass + fuel
 
     # 推力链
-    twr_max = float(rng.uniform(*R["twr_max"]))
+    twr_max = u("twr_max")
     real_max_thrust = twr_max * wet_mass * cfg.KERBIN_G
-    max_thrust_pct = float(rng.uniform(*R["max_thrust_pct"]))
-    min_thrust_pct = float(rng.uniform(*R["min_thrust_pct"]))
+    max_thrust_pct = u("max_thrust_pct")
+    min_thrust_pct = u("min_thrust_pct")
 
     # Isp -> 燃料消耗率
-    isp = float(rng.uniform(*R["isp"]))
+    isp = u("isp")
     fuel_consumption = 1.0 / (isp * cfg.G0)
 
     # 约束
-    max_angle_deg = float(rng.uniform(*R["max_angle_deg"]))
-    glide_slope_angle_deg = float(rng.uniform(*R["glide_slope_angle_deg"]))
+    max_angle_deg = u("max_angle_deg")
+    glide_slope_angle_deg = u("glide_slope_angle_deg")
 
     # 状态（位置：高度 + 水平偏移方向均匀；速度：三分量独立）
-    z = float(rng.uniform(*R["z"]))
-    rho = float(rng.uniform(*R["rho"]))
+    z = u("z")
+    rho = u("rho")
     theta = float(rng.uniform(0.0, 2.0 * np.pi))
     x = rho * np.cos(theta)
     y = rho * np.sin(theta)
 
-    vx = float(rng.uniform(*R["vx"]))
-    vy = float(rng.uniform(*R["vy"]))
-    vz = float(rng.uniform(*R["vz"]))
+    vx = u("vx")
+    vy = u("vy")
+    vz = u("vz")
 
     return {
         "x": x, "y": y, "z": z,

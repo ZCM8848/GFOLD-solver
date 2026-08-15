@@ -57,3 +57,12 @@ def test_reproducible_given_seed():
     a = sampling.sample_one(np.random.default_rng(123))
     b = sampling.sample_one(np.random.default_rng(123))
     assert a == b
+
+
+def test_override_sampling():
+    """overrides 覆盖独立输入，派生量仍按因果链自洽。"""
+    rng = np.random.default_rng(0)
+    d = sampling.sample_one(rng, overrides={"z": 9000.0, "vz": -700.0})
+    assert d["z"] == 9000.0
+    assert d["vz"] == -700.0
+    assert d["wet_mass"] == pytest.approx(d["dry_mass"] + d["fuel"])
